@@ -9,6 +9,20 @@ from gym import envs
 from gym.wrappers.atari_preprocessing import AtariPreprocessing
 from typing import *
 
+from utils.env_wrappers import SubprocVecEnv, DummyVecEnv
+
+def make_parallel_env(env_id, n_rollout_threads, seed, discrete_action, n_agents):
+    def get_env_fn(rank):
+        def init_env():
+            env = make_env(n_agents)
+            env.seed(seed + rank * 1000)
+            np.random.seed(seed + rank * 1000)
+            return env
+        return init_env
+    if n_rollout_threads == 1:
+        return DummyVecEnv([get_env_fn(0)])
+    else:
+        return SubprocVecEnv([get_env_fn(i) for i in range(n_rollout_threads)])
 
 def get_all_envs_id():
     return envs.registry.env_specs.keys()
@@ -246,6 +260,134 @@ def atari_benchmark_generator(
         env_names, n_random_envs=n_random_envs, n_parallel_envs=n_parallel_envs,
         eval_envs=eval_envs, n_experiences=n_experiences, env_wrappers=wrappers,
         envs_ids_to_sample_from=atari_ids, *args, **kwargs)
+    
+    
+def sean_benchmark_generator(
+        env_names: List[str] = [],
+        environments: List[gym.Env] = [],
+        n_random_envs: int = None, 
+        env_kwargs: Dict[str, Dict[Any, Any]] = dict(),
+        n_parallel_envs: int = 1,
+        eval_envs: Union[List[str], List[gym.Env]] = None,
+        n_experiences=None,
+        env_wrappers: Union[Callable[[Any], Wrapper], List[Callable[[
+            Any], Wrapper]], Dict[str, List[Callable[[Any], Wrapper]]]] = None,
+        envs_ids_to_sample_from: List[str] = None, *args, **kwargs) \
+            -> RLScenario:
+    """
+    Generates a RL benchmark with the provided options.
+    You can build a benchmark by either passing a sequence of registered env_ids
+    or of environment instances, or you can specify a random number of envs
+    to sample from `envs_ids_to_sample_from`. If multiple options are specified,
+    priority is given to topmost arguments.
+    An RLScenario will be returned which will give access to the usual
+    `train` and `eval` experience streams, with each experience containing
+    an Env with which the agent can interact.
+
+    Args:
+        env_names (List[str], optional): List of OpenAI Gym registered
+                environments. First option for creating a benchmark.
+        environments (List[gym.Env], optional): List of OpenAI Gym environments
+                instances. Second option for creating a benchmark.
+        n_random_envs (int, optional): Number of random envs to sample to
+                create a scenario. Note that you can specify a set of ids to 
+                sample from with the argument `envs_ids_to_sample_from`.
+                Third option for creating a benchmark.
+        env_kwargs (Dict[str, Dict[Any, Any]], optional): A dictionary 
+                <env_id: init_kwargs> used to pass extra args during
+                creation of envs. Defaults to dict().
+        n_parallel_envs (int, optional): Number of parallel environments to
+                instantiate, using `VectorizedEnv` to spawn multiple agents
+                with their own copy of the environment. Defaults to 1.
+        eval_envs (Union[List[str], List[gym.Env]], optional): List of env ids
+                to use during evaluation. If None is passed, train environments
+                will be used for evaluation.
+        n_experiences ([type], optional): Number of experiences to generate
+                with the provided envs. If greater than number of envs,
+                envs will be looped through. Defaults to number of envs.
+        env_wrappers (Union[Wrapper, List[Wrapper], Dict[str, List[Wrapper]]],
+                    optional):
+                A sequence of wrapper classes to be instatiated along the
+                provided envs ids. These are not considered if envs instances
+                are passed, as we assume they're already wrapped.
+                Defaults to None.
+        envs_ids_to_sample_from (List[str], optional): List of enviornments ids
+                to sample from, only valid if `n_random_envs` is specified.
+                Defaults to all registered environments ids.
+
+    Raises:
+        ValueError: If none of the three options for creating environments are
+                specified, namely: `env_names`, `environments`
+                and `n_random_envs`.
+        ValueError: If unrecognized `eval_envs` type is passed.
+
+    Returns:
+        RLScenario: Scenario with `train` and `eval` experience stream
+                containing specified environments.
+    """
+
+
+    # three ways to create environments from gym
+    if env_names is not None and len(env_names):
+        envs_ = [
+                 make_parallel_env(
+                     ename, env_kwargs.get(ename, dict()),
+                     wrappers[ename]) for ename in env_names]
+    elif environments is not None and len(environments):
+        # no wrapping if environments are passed explicitely
+        envs_ = environments
+    elif n_random_envs is not None and n_random_envs > 0:
+        # choose `n_envs` random envs either from the registered ones
+        # or from the provided ones
+        to_choose = get_all_envs_id(
+        ) if envs_ids_to_sample_from is not None else envs_ids_to_sample_from
+        ids = random.sample(to_choose, n_random_envs)  
+        envs_ = [
+            make_parallel_env(
+                ename, env_kwargs.get(ename, {}),
+                wrappers[ename]) for ename in ids]
+    else:
+        raise ValueError(
+            'You must provide at least one argument among `env_names`, \
+                `environments`, `n_random_envs`!')
+
+    # eval environments
+    # if not provided, the same training environments are also used for testing
+    if eval_envs is None:
+        eval_envs = envs_
+    elif len(eval_envs) and type(eval_envs[0]) is str:
+        eval_envs = [
+            make_parallel_env(
+                ename, env_kwargs.get(ename, {}),
+                wrappers[ename]) for ename in eval_envs]
+        # TODO: delayed feature
+        # if a list of env names is provided
+        # we don't build the enviornment until actual evaluation occurs
+        # eval_envs = [
+        #     lambda: gym.make(ename, **env_kwargs.get(ename, {}))
+        #     for ename in eval_envs]
+    elif len(eval_envs) and not isinstance(eval_envs[0], gym.Env):
+        raise ValueError(
+            "Unrecognized type for `eval_envs`, make sure to pass a list of \
+                environments or of environment names.")
+
+    # envs will be cycled through if n_experiences > len(envs_) otherwise
+    # only the first n will be used
+    n_experiences = n_experiences or len(envs_)         
+    if n_experiences < len(envs_):
+        envs_ = envs_[:n_experiences]
+    elif n_experiences > len(envs_):
+        # cycle through envs sequentially, referencing same object
+        for i in range(n_experiences - len(envs_)):
+            envs_.append(envs_[i % len(envs_)])       
+    
+    # # per_experience_episodes variable number of episodes depending on env
+    # if type(per_experience_episodes) is list:
+    #     assert len(per_experience_episodes) == n_experiences
+
+    return RLScenario(envs=envs_, n_parallel_envs=n_parallel_envs, 
+                      eval_envs=eval_envs, wrappers_generators=wrappers,
+                      *args, **kwargs)
 
 
 # # check AvalancheLab extra dependency
